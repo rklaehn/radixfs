@@ -352,9 +352,10 @@ impl Inner {
             content.truncate(usize::try_from(new_length).unwrap())
         }
 
+        let now = time_now();
         attrs.size = new_length;
-        attrs.last_metadata_changed = time_now();
-        attrs.last_modified = time_now();
+        attrs.last_metadata_changed = now;
+        attrs.last_modified = now;
 
         // Clear SETUID & SETGID on truncate
         clear_suid_sgid(&mut attrs);
@@ -397,8 +398,9 @@ impl Inner {
         ) {
             return Err(libc::EACCES);
         }
-        parent_attrs.last_modified = time_now();
-        parent_attrs.last_metadata_changed = time_now();
+        let now = time_now();
+        parent_attrs.last_modified = now;
+        parent_attrs.last_metadata_changed = now;
         self.write_inode(&parent_attrs);
 
         let mut entries = self.get_directory_content(parent).unwrap();
@@ -416,15 +418,16 @@ impl Filesystem for RadixFS {
         #[allow(unused_variables)] config: &mut KernelConfig,
     ) -> Result<(), c_int> {
         let mut inner = self.inner.lock();
+        let now = time_now();
         if inner.get_inode(FUSE_ROOT_ID).is_err() {
             // Initialize with empty filesystem
             let root = InodeAttributes {
                 inode: FUSE_ROOT_ID,
                 open_file_handles: 0,
                 size: 0,
-                last_accessed: time_now(),
-                last_modified: time_now(),
-                last_metadata_changed: time_now(),
+                last_accessed: now,
+                last_modified: now,
+                last_metadata_changed: now,
                 kind: FileKind::Directory,
                 mode: 0o777,
                 hardlinks: 2,
@@ -502,6 +505,7 @@ impl Filesystem for RadixFS {
             }
         };
 
+        let now = time_now();
         if let Some(mode) = mode {
             debug!("chmod() called with {:?}, {:o}", inode, mode);
             if req.uid() != 0 && req.uid() != attrs.uid {
@@ -518,7 +522,7 @@ impl Filesystem for RadixFS {
             } else {
                 attrs.mode = mode as u16;
             }
-            attrs.last_metadata_changed = time_now();
+            attrs.last_metadata_changed = now;
             inner.write_inode(&attrs);
             reply.attr(&Duration::new(0, 0), &attrs.into());
             return;
@@ -565,7 +569,7 @@ impl Filesystem for RadixFS {
                     attrs.mode &= !libc::S_ISGID as u16;
                 }
             }
-            attrs.last_metadata_changed = time_now();
+            attrs.last_metadata_changed = now;
             inner.write_inode(&attrs);
             reply.attr(&Duration::new(0, 0), &attrs.into());
             return;
@@ -714,8 +718,9 @@ impl Filesystem for RadixFS {
             reply.error(libc::EACCES);
             return;
         }
-        parent_attrs.last_modified = time_now();
-        parent_attrs.last_metadata_changed = time_now();
+        let now = time_now();
+        parent_attrs.last_modified = now;
+        parent_attrs.last_metadata_changed = now;
         inner.write_inode(&parent_attrs);
 
         if req.uid() != 0 {
@@ -727,9 +732,9 @@ impl Filesystem for RadixFS {
             inode,
             open_file_handles: 0,
             size: 0,
-            last_accessed: time_now(),
-            last_modified: time_now(),
-            last_metadata_changed: time_now(),
+            last_accessed: now,
+            last_modified: now,
+            last_metadata_changed: now,
             kind: as_file_kind(mode),
             mode: inner.creation_mode(mode),
             hardlinks: 1,
@@ -790,8 +795,9 @@ impl Filesystem for RadixFS {
             reply.error(libc::EACCES);
             return;
         }
-        parent_attrs.last_modified = time_now();
-        parent_attrs.last_metadata_changed = time_now();
+        let now = time_now();
+        parent_attrs.last_modified = now;
+        parent_attrs.last_metadata_changed = now;
         inner.write_inode(&parent_attrs);
 
         if req.uid() != 0 {
@@ -806,9 +812,9 @@ impl Filesystem for RadixFS {
             inode,
             open_file_handles: 0,
             size: BLOCK_SIZE,
-            last_accessed: time_now(),
-            last_modified: time_now(),
-            last_metadata_changed: time_now(),
+            last_accessed: now,
+            last_modified: now,
+            last_metadata_changed: now,
             kind: FileKind::Directory,
             mode: inner.creation_mode(mode),
             hardlinks: 2, // Directories start with link count of 2, since they have a self link
@@ -872,12 +878,13 @@ impl Filesystem for RadixFS {
             return;
         }
 
-        parent_attrs.last_metadata_changed = time_now();
-        parent_attrs.last_modified = time_now();
+        let now = time_now();
+        parent_attrs.last_metadata_changed = now;
+        parent_attrs.last_modified = now;
         inner.write_inode(&parent_attrs);
 
         attrs.hardlinks -= 1;
-        attrs.last_metadata_changed = time_now();
+        attrs.last_metadata_changed = now;
         inner.write_inode(&attrs);
         inner.gc_inode(&attrs);
 
@@ -934,12 +941,13 @@ impl Filesystem for RadixFS {
             return;
         }
 
-        parent_attrs.last_metadata_changed = time_now();
-        parent_attrs.last_modified = time_now();
+        let now = time_now();
+        parent_attrs.last_metadata_changed = now;
+        parent_attrs.last_modified = now;
         inner.write_inode(&parent_attrs);
 
         attrs.hardlinks = 0;
-        attrs.last_metadata_changed = time_now();
+        attrs.last_metadata_changed = now;
         inner.write_inode(&attrs);
         inner.gc_inode(&attrs);
 
@@ -979,8 +987,9 @@ impl Filesystem for RadixFS {
             reply.error(libc::EACCES);
             return;
         }
-        parent_attrs.last_modified = time_now();
-        parent_attrs.last_metadata_changed = time_now();
+        let now = time_now();
+        parent_attrs.last_modified = now;
+        parent_attrs.last_metadata_changed = now;
         inner.write_inode(&parent_attrs);
 
         let inode = inner.allocate_next_inode();
@@ -988,9 +997,9 @@ impl Filesystem for RadixFS {
             inode,
             open_file_handles: 0,
             size: link.as_os_str().as_bytes().len() as u64,
-            last_accessed: time_now(),
-            last_modified: time_now(),
-            last_metadata_changed: time_now(),
+            last_accessed: now,
+            last_modified: now,
+            last_metadata_changed: now,
             kind: FileKind::Symlink,
             mode: 0o777,
             hardlinks: 1,
@@ -1094,6 +1103,7 @@ impl Filesystem for RadixFS {
             }
         }
 
+        let now = time_now();
         #[cfg(target_os = "linux")]
         if flags & libc::RENAME_EXCHANGE as u32 != 0 {
             let mut new_inode_attrs = match self.lookup_name(new_parent, new_name) {
@@ -1118,15 +1128,15 @@ impl Filesystem for RadixFS {
             );
             self.write_directory_content(parent, entries);
 
-            parent_attrs.last_metadata_changed = time_now();
-            parent_attrs.last_modified = time_now();
+            parent_attrs.last_metadata_changed = now;
+            parent_attrs.last_modified = now;
             self.write_inode(&parent_attrs);
-            new_parent_attrs.last_metadata_changed = time_now();
-            new_parent_attrs.last_modified = time_now();
+            new_parent_attrs.last_metadata_changed = now;
+            new_parent_attrs.last_modified = now;
             self.write_inode(&new_parent_attrs);
-            inode_attrs.last_metadata_changed = time_now();
+            inode_attrs.last_metadata_changed = now;
             self.write_inode(&inode_attrs);
-            new_inode_attrs.last_metadata_changed = time_now();
+            new_inode_attrs.last_metadata_changed = now;
             self.write_inode(&new_inode_attrs);
 
             if inode_attrs.kind == FileKind::Directory {
@@ -1186,7 +1196,7 @@ impl Filesystem for RadixFS {
             } else {
                 existing_inode_attrs.hardlinks -= 1;
             }
-            existing_inode_attrs.last_metadata_changed = time_now();
+            existing_inode_attrs.last_metadata_changed = now;
             inner.write_inode(&existing_inode_attrs);
             inner.gc_inode(&existing_inode_attrs);
         }
@@ -1202,13 +1212,13 @@ impl Filesystem for RadixFS {
         );
         inner.write_directory_content(new_parent, entries);
 
-        parent_attrs.last_metadata_changed = time_now();
-        parent_attrs.last_modified = time_now();
+        parent_attrs.last_metadata_changed = now;
+        parent_attrs.last_modified = now;
         inner.write_inode(&parent_attrs);
-        new_parent_attrs.last_metadata_changed = time_now();
-        new_parent_attrs.last_modified = time_now();
+        new_parent_attrs.last_metadata_changed = now;
+        new_parent_attrs.last_modified = now;
         inner.write_inode(&new_parent_attrs);
-        inode_attrs.last_metadata_changed = time_now();
+        inode_attrs.last_metadata_changed = now;
         inner.write_inode(&inode_attrs);
 
         if inode_attrs.kind == FileKind::Directory {
@@ -1240,11 +1250,12 @@ impl Filesystem for RadixFS {
                 return;
             }
         };
+        let now = time_now();
         if let Err(error_code) = inner.insert_link(req, new_parent, new_name, inode, attrs.kind) {
             reply.error(error_code);
         } else {
             attrs.hardlinks += 1;
-            attrs.last_metadata_changed = time_now();
+            attrs.last_metadata_changed = now;
             inner.write_inode(&attrs);
             reply.entry(&Duration::new(0, 0), &attrs.into(), 0);
         }
@@ -1352,6 +1363,7 @@ impl Filesystem for RadixFS {
             return;
         }
 
+        let now = time_now();
         if let Some(file) = inner.data.get_mut(&inode) {
             let offset = usize::try_from(offset).unwrap();
             if file.len() < offset + data.len() {
@@ -1360,8 +1372,8 @@ impl Filesystem for RadixFS {
             file[offset..offset + data.len()].copy_from_slice(data);
 
             let mut attrs = inner.get_inode(inode).unwrap();
-            attrs.last_metadata_changed = time_now();
-            attrs.last_modified = time_now();
+            attrs.last_metadata_changed = now;
+            attrs.last_modified = now;
             if data.len() + offset as usize > attrs.size as usize {
                 attrs.size = (data.len() + offset as usize) as u64;
             }
@@ -1525,8 +1537,9 @@ impl Filesystem for RadixFS {
                 return;
             }
 
+            let now = time_now();
             attrs.xattrs.insert(key.as_bytes().to_vec(), value.to_vec());
-            attrs.last_metadata_changed = time_now();
+            attrs.last_metadata_changed = now;
             inner.write_inode(&attrs);
             reply.ok();
         } else {
@@ -1597,6 +1610,7 @@ impl Filesystem for RadixFS {
                 return;
             }
 
+            let now = time_now();
             if attrs.xattrs.remove(key.as_bytes()).is_none() {
                 #[cfg(target_os = "linux")]
                 reply.error(libc::ENODATA);
@@ -1604,7 +1618,7 @@ impl Filesystem for RadixFS {
                 reply.error(libc::ENOATTR);
                 return;
             }
-            attrs.last_metadata_changed = time_now();
+            attrs.last_metadata_changed = now;
             inner.write_inode(&attrs);
             reply.ok();
         } else {
@@ -1655,6 +1669,7 @@ impl Filesystem for RadixFS {
             }
         };
 
+        let now = time_now();
         let mut parent_attrs = match inner.get_inode(parent) {
             Ok(attrs) => attrs,
             Err(error_code) => {
@@ -1674,8 +1689,8 @@ impl Filesystem for RadixFS {
             reply.error(libc::EACCES);
             return;
         }
-        parent_attrs.last_modified = time_now();
-        parent_attrs.last_metadata_changed = time_now();
+        parent_attrs.last_modified = now;
+        parent_attrs.last_metadata_changed = now;
         inner.write_inode(&parent_attrs);
 
         if req.uid() != 0 {
@@ -1687,9 +1702,9 @@ impl Filesystem for RadixFS {
             inode,
             open_file_handles: 1,
             size: 0,
-            last_accessed: time_now(),
-            last_modified: time_now(),
-            last_metadata_changed: time_now(),
+            last_accessed: now,
+            last_modified: now,
+            last_metadata_changed: now,
             kind: as_file_kind(mode),
             mode: inner.creation_mode(mode),
             hardlinks: 1,
@@ -1739,8 +1754,8 @@ impl Filesystem for RadixFS {
             }
             if mode & libc::FALLOC_FL_KEEP_SIZE == 0 {
                 let mut attrs = self.get_inode(inode).unwrap();
-                attrs.last_metadata_changed = time_now();
-                attrs.last_modified = time_now();
+                attrs.last_metadata_changed = now;
+                attrs.last_modified = now;
                 if (offset + length) as u64 > attrs.size {
                     attrs.size = (offset + length) as u64;
                 }
@@ -1778,6 +1793,7 @@ impl Filesystem for RadixFS {
             reply.error(libc::EACCES);
             return;
         }
+        let now = time_now();
         let src_offset = usize::try_from(src_offset).unwrap();
         let dest_offset = usize::try_from(dest_offset).unwrap();
         let size = usize::try_from(size).unwrap();
@@ -1793,8 +1809,8 @@ impl Filesystem for RadixFS {
                 dest_file[dest_offset..dest_offset + read_size].copy_from_slice(&tmp);
 
                 let mut attrs = inner.get_inode(dest_inode).unwrap();
-                attrs.last_metadata_changed = time_now();
-                attrs.last_modified = time_now();
+                attrs.last_metadata_changed = now;
+                attrs.last_modified = now;
                 if inner.data.len() + dest_offset as usize > attrs.size as usize {
                     attrs.size = (inner.data.len() + dest_offset as usize) as u64;
                 }
@@ -1902,18 +1918,6 @@ fn main() {
                 .takes_value(true),
         )
         .arg(
-            Arg::new("direct-io")
-                .long("direct-io")
-                .requires("mount-point")
-                .help("Mount FUSE with direct IO"),
-        )
-        .arg(Arg::new("fsck").long("fsck").help("Run a filesystem check"))
-        .arg(
-            Arg::new("suid")
-                .long("suid")
-                .help("Enable setuid support when run as root"),
-        )
-        .arg(
             Arg::new("v")
                 .short('v')
                 .multiple_occurrences(true)
@@ -1935,20 +1939,7 @@ fn main() {
         .init();
 
     let mut options = vec![MountOption::FSName("fuser".to_string())];
-
-    #[cfg(feature = "abi-7-26")]
-    {
-        if matches.is_present("suid") {
-            info!("setuid bit support enabled");
-            options.push(MountOption::Suid);
-        } else {
-            options.push(MountOption::AutoUnmount);
-        }
-    }
-    #[cfg(not(feature = "abi-7-26"))]
-    {
-        options.push(MountOption::AutoUnmount);
-    }
+    options.push(MountOption::AutoUnmount);
     if let Ok(enabled) = fuse_allow_other_enabled() {
         if enabled {
             options.push(MountOption::AllowOther);
