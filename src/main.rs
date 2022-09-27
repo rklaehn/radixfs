@@ -7,9 +7,10 @@ use fuser::{
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
     FUSE_ROOT_ID,
 };
-use log::{debug, warn};
+use log::{debug, warn, info};
 use log::{error, LevelFilter};
 use parking_lot::Mutex;
+use radixdb::RadixTree;
 use serde::{Deserialize, Serialize};
 use std::cmp::min;
 use std::collections::BTreeMap;
@@ -250,7 +251,7 @@ impl RadixFS {
 #[derive(Debug, Default, Clone)]
 struct Inner {
     next_file_handle: u64,
-    inodes: BTreeMap<Inode, Vec<u8>>,
+    inodes: RadixTree,
     data: BTreeMap<Inode, Vec<u8>>,
 }
 
@@ -260,11 +261,12 @@ impl Inner {
     }
 
     fn allocate_next_inode(&self) -> Inode {
-        let current_inode = if let Some((k, _)) = self.inodes.iter().last() {
-            *k
+        let current_inode = if let Some((k, _)) = self.inodes.last_entry(vec![]) {
+            u64::from_be_bytes(k.try_into().unwrap())
         } else {
             fuser::FUSE_ROOT_ID
         };
+        info!("allocate_next_inode {}", current_inode + 1);
         current_inode + 1
     }
 
@@ -305,8 +307,11 @@ impl Inner {
     }
 
     fn get_inode(&self, inode: Inode) -> Result<InodeAttributes, c_int> {
+        info!("get_inode({})", inode);
+        let inode = inode.to_be_bytes();
         if let Some(value) = self.inodes.get(&inode) {
-            let attrs = bincode::deserialize(value).unwrap();
+            info!("success {}", value.len());
+            let attrs = bincode::deserialize(value.as_ref()).unwrap();
             Ok(attrs)
         } else {
             Err(libc::ENOENT)
@@ -314,15 +319,17 @@ impl Inner {
     }
 
     fn write_inode(&mut self, inode: &InodeAttributes) {
+        info!("write_inode({})", inode.inode);
         let bytes = bincode::serialize(inode).unwrap();
-        self.inodes.insert(inode.inode, bytes);
+        let inode = inode.inode.to_be_bytes();
+        self.inodes.insert(inode, bytes);
     }
 
     // Check whether a file should be removed from storage. Should be called after decrementing
     // the link count, or closing a file handle
     fn gc_inode(&mut self, inode: &InodeAttributes) -> bool {
         if inode.hardlinks == 0 && inode.open_file_handles == 0 {
-            self.inodes.remove(&inode.inode);
+            self.inodes.remove(inode.inode.to_be_bytes());
             self.data.remove(&inode.inode);
 
             return true;
@@ -664,7 +671,8 @@ impl Filesystem for RadixFS {
 
     fn readlink(&mut self, _req: &Request, inode: u64, reply: ReplyData) {
         debug!("readlink() called on {:?}", inode);
-        if let Some(file) = self.inner.lock().data.get(&inode) {
+        let inner = self.inner.lock();
+        if let Some(file) = inner.data.get(&inode) {
             reply.data(file);
         } else {
             reply.error(libc::ENOENT);
@@ -1321,7 +1329,7 @@ impl Filesystem for RadixFS {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        debug!(
+        info!(
             "read() called on {:?} offset={:?} size={:?}",
             inode, offset, size
         );
@@ -1332,7 +1340,7 @@ impl Filesystem for RadixFS {
             return;
         }
 
-        if let Some(file) = self.inner.lock().data.get(&inode) {
+        if let Some(file) = inner.data.get(&inode) {
             let file_size = file.len() as u64;
             // Could underflow if file length is less than local_start
             let read_size = min(size, file_size.saturating_sub(offset as u64) as u32);
@@ -1355,7 +1363,7 @@ impl Filesystem for RadixFS {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        debug!("write() called with {:?} size={:?}", inode, data.len());
+        info!("write() called with {:?} size={:?}", inode, data.len());
         assert!(offset >= 0);
         let mut inner = self.inner.lock();
         if !inner.check_file_handle_write(fh) {
@@ -1402,9 +1410,10 @@ impl Filesystem for RadixFS {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         if let Ok(mut attrs) = inner.get_inode(inode) {
             attrs.open_file_handles -= 1;
+            inner.write_inode(&attrs);
         }
         reply.ok();
     }
@@ -1498,9 +1507,10 @@ impl Filesystem for RadixFS {
         _flags: i32,
         reply: ReplyEmpty,
     ) {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         if let Ok(mut attrs) = inner.get_inode(inode) {
             attrs.open_file_handles -= 1;
+            inner.write_inode(&attrs);
         }
         reply.ok();
     }

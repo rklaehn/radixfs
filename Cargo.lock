@@ -277,8 +277,6 @@ dependencies = [
 [[package]]
 name = "radixdb"
 version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62f9695a2ff15b1597b717d884eb20b1376811757bdd92afcbaf573726b74557"
 dependencies = [
  "anyhow",
  "fnv",
