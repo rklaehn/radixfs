@@ -7,7 +7,7 @@ use fuser::{
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
     FUSE_ROOT_ID,
 };
-use log::{debug, warn, info};
+use log::{debug, info, warn};
 use log::{error, LevelFilter};
 use parking_lot::Mutex;
 use radixdb::RadixTree;
@@ -248,6 +248,13 @@ impl RadixFS {
     }
 }
 
+fn inode_key(inode: Inode) -> [u8; 12] {
+    let mut res = [0u8; 12];
+    res[0..4].copy_from_slice(b"inod");
+    res[4..].copy_from_slice(&inode.to_be_bytes());
+    res
+}
+
 #[derive(Debug, Default, Clone)]
 struct Inner {
     next_file_handle: u64,
@@ -262,7 +269,8 @@ impl Inner {
 
     fn allocate_next_inode(&self) -> Inode {
         let current_inode = if let Some((k, _)) = self.inodes.last_entry(vec![]) {
-            u64::from_be_bytes(k.try_into().unwrap())
+            println!("{:?}", k);
+            u64::from_be_bytes(k[4..].try_into().unwrap())
         } else {
             fuser::FUSE_ROOT_ID
         };
@@ -308,10 +316,9 @@ impl Inner {
 
     fn get_inode(&self, inode: Inode) -> Result<InodeAttributes, c_int> {
         info!("get_inode({})", inode);
-        let inode = inode.to_be_bytes();
+        let inode = inode_key(inode);
         if let Some(value) = self.inodes.get(&inode) {
-            info!("success {}", value.len());
-            let attrs = bincode::deserialize(value.as_ref()).unwrap();
+            let attrs: InodeAttributes = bincode::deserialize(value.as_ref()).unwrap();
             Ok(attrs)
         } else {
             Err(libc::ENOENT)
@@ -321,7 +328,7 @@ impl Inner {
     fn write_inode(&mut self, inode: &InodeAttributes) {
         info!("write_inode({:?})", inode);
         let bytes = bincode::serialize(inode).unwrap();
-        let inode = inode.inode.to_be_bytes();
+        let inode = inode_key(inode.inode);
         self.inodes.insert(inode, bytes);
     }
 
@@ -329,7 +336,7 @@ impl Inner {
     // the link count, or closing a file handle
     fn gc_inode(&mut self, inode: &InodeAttributes) -> bool {
         if inode.hardlinks == 0 && inode.open_file_handles == 0 {
-            self.inodes.remove(inode.inode.to_be_bytes());
+            self.inodes.remove(inode_key(inode.inode));
             self.data.remove(&inode.inode);
 
             return true;
@@ -1419,7 +1426,7 @@ impl Filesystem for RadixFS {
     }
 
     fn opendir(&mut self, req: &Request, inode: u64, flags: i32, reply: ReplyOpen) {
-        debug!("opendir() called on {:?}", inode);
+        info!("opendir() called on {:?}", inode);
         let (access_mask, read, write) = match flags & libc::O_ACCMODE {
             libc::O_RDONLY => {
                 // Behavior is undefined, but most filesystems return EACCES
@@ -1507,6 +1514,7 @@ impl Filesystem for RadixFS {
         _flags: i32,
         reply: ReplyEmpty,
     ) {
+        info!("releasedir {}", inode);
         let mut inner = self.inner.lock();
         if let Ok(mut attrs) = inner.get_inode(inode) {
             attrs.open_file_handles -= 1;
@@ -1516,7 +1524,7 @@ impl Filesystem for RadixFS {
     }
 
     fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
-        warn!("statfs() implementation is a stub");
+        info!("statfs() implementation is a stub");
         // TODO: real implementation of this
         reply.statfs(
             10_000,
