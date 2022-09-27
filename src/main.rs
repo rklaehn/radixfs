@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor, ErrorKind};
+use std::ops::Range;
 use std::os::raw::c_int;
 use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "linux")]
@@ -253,6 +254,89 @@ fn inode_key(inode: Inode) -> [u8; 12] {
     res[0..4].copy_from_slice(b"inod");
     res[4..].copy_from_slice(&inode.to_be_bytes());
     res
+}
+
+fn content_key(inode: Inode) -> [u8; 12] {
+    let mut res = [0u8; 12];
+    res[0..4].copy_from_slice(b"data");
+    res[4..].copy_from_slice(&inode.to_be_bytes());
+    res
+}
+
+/// Given a range of offsets and a page size, calculate which pages fully cover the range.
+///
+/// Returns a triple of (optional first partial page, optional range of full pages, optional last partial page)
+fn pages_from_range(
+    range: Range<u64>,
+    block_size: u64,
+) -> (
+    Option<(u64, Range<u64>)>,
+    Option<Range<u64>>,
+    Option<(u64, Range<u64>)>,
+) {
+    if range.is_empty() {
+        // Special case: empty range
+        return Default::default();
+    }
+    let start = range.start;
+    let end = range.end;
+    let start_offset = start % block_size;
+    let start_page = start / block_size;
+    let start_page_full = start_offset == 0;
+    let end_page = (end - 1) / block_size;
+    let end_offset = end % block_size;
+    let end_page_full = end_offset == 0;
+    let (first, range, last) = if start_page_full && end_page_full {
+        // just full pages
+        (None, Some(start_page..end_page + 1), None)
+    } else if start_page == end_page {
+        // just one partial page
+        (Some((start_page, start_offset..end_offset)), None, None)
+    } else if start_page_full {
+        // start page full, end page partial
+        (
+            None,
+            Some(start_page..end_page),
+            Some((end_page, 0..end_offset)),
+        )
+    } else if end_page_full {
+        // start page partial, end page full
+        (
+            Some((start_page, start_offset..block_size)),
+            Some(start_page + 1..end_page + 1),
+            None,
+        )
+    } else {
+        // start page partial, end page partial
+        (
+            Some((start_page, start_offset..block_size)),
+            Some(start_page + 1..end_page),
+            Some((end_page, 0..end_offset)),
+        )
+    };
+    (first, range.filter(|x| !x.is_empty()), last)
+}
+
+#[test]
+fn test_pages_from_range() {
+    assert_eq!(pages_from_range(0..0, 10), (None, None, None));
+    assert_eq!(pages_from_range(0..1, 10), (Some((0, 0..1)), None, None));
+    assert_eq!(pages_from_range(10..11, 10), (Some((1, 0..1)), None, None));
+    assert_eq!(pages_from_range(0..10, 10), (None, Some(0..1), None));
+    assert_eq!(pages_from_range(0..20, 10), (None, Some(0..2), None));
+    assert_eq!(
+        pages_from_range(1..19, 10),
+        (Some((0, 1..10)), None, Some((1, 0..9)))
+    );
+    assert_eq!(pages_from_range(0..30, 10), (None, Some(0..3), None));
+    assert_eq!(
+        pages_from_range(0..29, 10),
+        (None, Some(0..2), Some((2, 0..9)))
+    );
+    assert_eq!(
+        pages_from_range(1..30, 10),
+        (Some((0, 1..10)), Some(1..3), None)
+    );
 }
 
 #[derive(Debug, Default, Clone)]
