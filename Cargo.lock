@@ -299,6 +299,7 @@ dependencies = [
  "fuser",
  "libc",
  "log",
+ "parking_lot",
  "radixdb",
  "serde",
 ]
