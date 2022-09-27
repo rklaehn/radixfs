@@ -42,7 +42,7 @@ type Inode = u64;
 
 type DirectoryDescriptor = BTreeMap<Vec<u8>, (Inode, FileKind)>;
 
-#[derive(Serialize, Deserialize, Copy, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq)]
 enum FileKind {
     File,
     Directory,
@@ -192,7 +192,7 @@ fn time_from_system_time(system_time: &SystemTime) -> (i64, u32) {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct InodeAttributes {
     pub inode: Inode,
     pub open_file_handles: u64, // Ref count of open file handles to this inode
@@ -319,7 +319,7 @@ impl Inner {
     }
 
     fn write_inode(&mut self, inode: &InodeAttributes) {
-        info!("write_inode({})", inode.inode);
+        info!("write_inode({:?})", inode);
         let bytes = bincode::serialize(inode).unwrap();
         let inode = inode.inode.to_be_bytes();
         self.inodes.insert(inode, bytes);
