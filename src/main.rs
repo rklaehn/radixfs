@@ -12,11 +12,10 @@ use log::{error, LevelFilter};
 use parking_lot::Mutex;
 use radixdb::RadixTree;
 use serde::{Deserialize, Serialize};
-use std::cmp::min;
 use std::collections::BTreeMap;
+use std::env;
 use std::ffi::OsStr;
-use std::fs::File;
-use std::io::{BufRead, BufReader, Cursor, ErrorKind};
+use std::io::{Cursor, ErrorKind};
 use std::ops::Range;
 use std::os::raw::c_int;
 use std::os::unix::ffi::OsStrExt;
@@ -25,7 +24,6 @@ use std::os::unix::io::IntoRawFd;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::{env, io};
 
 const BLOCK_SIZE: u64 = 512;
 const MAX_NAME_LENGTH: u32 = 255;
@@ -249,111 +247,178 @@ impl RadixFS {
     }
 }
 
+const fn inode_prefix() -> [u8; 4] {
+    *b"inod"
+}
+
 fn inode_key(inode: Inode) -> [u8; 12] {
     let mut res = [0u8; 12];
-    res[0..4].copy_from_slice(b"inod");
+    res[0..4].copy_from_slice(&inode_prefix());
     res[4..].copy_from_slice(&inode.to_be_bytes());
     res
 }
 
-fn content_key(inode: Inode) -> [u8; 12] {
+fn content_prefix(inode: Inode) -> [u8; 12] {
     let mut res = [0u8; 12];
     res[0..4].copy_from_slice(b"data");
-    res[4..].copy_from_slice(&inode.to_be_bytes());
+    res[4..12].copy_from_slice(&inode.to_be_bytes());
     res
 }
+
+fn content_key(inode: Inode, page: u64) -> [u8; 20] {
+    let mut res = [0u8; 20];
+    res[0..4].copy_from_slice(b"data");
+    res[4..12].copy_from_slice(&inode.to_be_bytes());
+    res[12..20].copy_from_slice(&page.to_be_bytes());
+    res
+}
+
+type PartialPage = Option<(u64, Range<usize>)>;
 
 /// Given a range of offsets and a page size, calculate which pages fully cover the range.
 ///
 /// Returns a triple of (optional first partial page, optional range of full pages, optional last partial page)
 fn pages_from_range(
     range: Range<u64>,
-    block_size: u64,
-) -> (
-    Option<(u64, Range<u64>)>,
-    Option<Range<u64>>,
-    Option<(u64, Range<u64>)>,
-) {
-    if range.is_empty() {
-        // Special case: empty range
-        return Default::default();
-    }
+    block_size: usize,
+) -> (PartialPage, Range<u64>, PartialPage) {
     let start = range.start;
     let end = range.end;
-    let start_offset = start % block_size;
-    let start_page = start / block_size;
+    let block_size_u64 = block_size as u64;
+    let start_offset = (start % block_size_u64) as usize;
+    let start_page = start / block_size_u64;
     let start_page_full = start_offset == 0;
-    let end_page = (end - 1) / block_size;
-    let end_offset = end % block_size;
+    if range.is_empty() {
+        // Special case: empty range
+        return (Some((start_page, start_offset..start_offset)), 0..0, None);
+    }
+    let end_page = (end - 1) / block_size_u64;
+    let end_offset = (end % block_size_u64) as usize;
     let end_page_full = end_offset == 0;
-    let (first, range, last) = if start_page_full && end_page_full {
+    let (first, mut range, last) = if start_page_full && end_page_full {
         // just full pages
-        (None, Some(start_page..end_page + 1), None)
+        (None, start_page..end_page + 1, None)
     } else if start_page == end_page {
         // just one partial page
-        (Some((start_page, start_offset..end_offset)), None, None)
+        (Some((start_page, start_offset..end_offset)), 0..0, None)
     } else if start_page_full {
         // start page full, end page partial
-        (
-            None,
-            Some(start_page..end_page),
-            Some((end_page, 0..end_offset)),
-        )
+        (None, start_page..end_page, Some((end_page, 0..end_offset)))
     } else if end_page_full {
         // start page partial, end page full
         (
             Some((start_page, start_offset..block_size)),
-            Some(start_page + 1..end_page + 1),
+            start_page + 1..end_page + 1,
             None,
         )
     } else {
         // start page partial, end page partial
         (
             Some((start_page, start_offset..block_size)),
-            Some(start_page + 1..end_page),
+            start_page + 1..end_page,
             Some((end_page, 0..end_offset)),
         )
     };
-    (first, range.filter(|x| !x.is_empty()), last)
+    if range.is_empty() {
+        range = 0..0;
+    }
+    (first, range, last)
 }
 
 #[test]
 fn test_pages_from_range() {
-    assert_eq!(pages_from_range(0..0, 10), (None, None, None));
-    assert_eq!(pages_from_range(0..1, 10), (Some((0, 0..1)), None, None));
-    assert_eq!(pages_from_range(10..11, 10), (Some((1, 0..1)), None, None));
-    assert_eq!(pages_from_range(0..10, 10), (None, Some(0..1), None));
-    assert_eq!(pages_from_range(0..20, 10), (None, Some(0..2), None));
+    assert_eq!(pages_from_range(0..0, 10), (Some((0, 0..0)), 0..0, None));
+    assert_eq!(pages_from_range(0..1, 10), (Some((0, 0..1)), 0..0, None));
+    assert_eq!(pages_from_range(10..11, 10), (Some((1, 0..1)), 0..0, None));
+    assert_eq!(pages_from_range(0..10, 10), (None, 0..1, None));
+    assert_eq!(pages_from_range(0..20, 10), (None, 0..2, None));
     assert_eq!(
         pages_from_range(1..19, 10),
-        (Some((0, 1..10)), None, Some((1, 0..9)))
+        (Some((0, 1..10)), 0..0, Some((1, 0..9)))
     );
-    assert_eq!(pages_from_range(0..30, 10), (None, Some(0..3), None));
-    assert_eq!(
-        pages_from_range(0..29, 10),
-        (None, Some(0..2), Some((2, 0..9)))
-    );
-    assert_eq!(
-        pages_from_range(1..30, 10),
-        (Some((0, 1..10)), Some(1..3), None)
-    );
+    assert_eq!(pages_from_range(0..30, 10), (None, 0..3, None));
+    assert_eq!(pages_from_range(0..29, 10), (None, 0..2, Some((2, 0..9))));
+    assert_eq!(pages_from_range(1..30, 10), (Some((0, 1..10)), 1..3, None));
 }
 
 #[derive(Debug, Default, Clone)]
 struct Inner {
     next_file_handle: u64,
-    inodes: RadixTree,
-    data: BTreeMap<Inode, Vec<u8>>,
+    data: RadixTree,
 }
 
 impl Inner {
+    fn read_page(&self, inode: Inode, page: u64, buf: &mut [u8]) -> usize {
+        println!("read_page {} {} {}", inode, page, buf.len());
+        if let Some(page) = self.data.get(content_key(inode, page)) {
+            let len = buf.len().min(page.len());
+            buf[..len].copy_from_slice(&page[..len]);
+            len
+        } else {
+            0
+        }
+    }
+
+    fn write_page(&mut self, inode: Inode, page: u64, data: &[u8]) {
+        println!("write_page {} {} {}", inode, page, data.len());
+        self.data.insert(content_key(inode, page), data);
+    }
+
+    fn read_all(&self, inode: Inode) -> Option<Vec<u8>> {
+        let mut res = None;
+        for (_, value) in self.data.scan_prefix(content_prefix(inode)) {
+            res.get_or_insert(Vec::new())
+                .extend_from_slice(value.as_ref());
+        }
+        debug!("read_all {} {:?}", inode, res);
+        res
+    }
+
+    fn write_range(&mut self, inode: Inode, offset: u64, data: &[u8]) {
+        let write_range = offset..offset + (u64::try_from(data.len()).unwrap());
+        let (first, full, last) = pages_from_range(write_range, 4096);
+        let mut t = [0u8; 4096];
+        let mut d = data;
+        // write first incomplete page
+        if let Some((page, range)) = first {
+            let len = self.read_page(inode, page, &mut t);
+            let (curr, rest) = d.split_at(range.len());
+            t[range.clone()].copy_from_slice(curr);
+            self.write_page(inode, page, &t[..len.max(range.end)]);
+            d = rest;
+        }
+        // write full pages
+        if !full.is_empty() {
+            for page in full {
+                let (curr, rest) = d.split_at(4096);
+                t.copy_from_slice(curr);
+                self.write_page(inode, page, &t);
+                d = rest;
+            }
+        }
+        // write last incomplete page
+        if let Some((page, range)) = last {
+            let len = self.read_page(inode, page, &mut t);
+            let (curr, rest) = d.split_at(range.len());
+            t[range.clone()].copy_from_slice(curr);
+            self.write_page(inode, page, &t[..len.max(range.end)]);
+            d = rest;
+        }
+        assert!(d.is_empty());
+    }
+
+    fn write_all(&mut self, inode: Inode, data: &[u8]) {
+        self.data.remove_prefix(content_prefix(inode));
+        self.write_range(inode, 0, data);
+    }
+
     fn creation_mode(&self, mode: u32) -> u16 {
         (mode & !(libc::S_ISUID | libc::S_ISGID) as u32) as u16
     }
 
     fn allocate_next_inode(&self) -> Inode {
-        let current_inode = if let Some((k, _)) = self.inodes.last_entry(vec![]) {
-            println!("{:?}", k);
+        let inodes = self.data.filter_prefix(inode_prefix());
+        let current_inode = if let Some((k, _)) = inodes.last_entry(vec![]) {
             u64::from_be_bytes(k[4..].try_into().unwrap())
         } else {
             fuser::FUSE_ROOT_ID
@@ -386,7 +451,7 @@ impl Inner {
     }
 
     fn get_directory_content(&self, inode: Inode) -> Result<DirectoryDescriptor, c_int> {
-        if let Some(data) = self.data.get(&inode) {
+        if let Some(data) = self.read_all(inode) {
             Ok(bincode::deserialize_from(Cursor::new(data)).unwrap())
         } else {
             Err(libc::ENOENT)
@@ -395,13 +460,12 @@ impl Inner {
 
     fn write_directory_content(&mut self, inode: Inode, entries: DirectoryDescriptor) {
         let data = bincode::serialize(&entries).unwrap();
-        self.data.insert(inode, data);
+        self.write_all(inode, &data);
     }
 
     fn get_inode(&self, inode: Inode) -> Result<InodeAttributes, c_int> {
         info!("get_inode({})", inode);
-        let inode = inode_key(inode);
-        if let Some(value) = self.inodes.get(&inode) {
+        if let Some(value) = self.data.get(&inode_key(inode)) {
             let attrs: InodeAttributes = bincode::deserialize(value.as_ref()).unwrap();
             Ok(attrs)
         } else {
@@ -412,21 +476,31 @@ impl Inner {
     fn write_inode(&mut self, inode: &InodeAttributes) {
         info!("write_inode({:?})", inode);
         let bytes = bincode::serialize(inode).unwrap();
-        let inode = inode_key(inode.inode);
-        self.inodes.insert(inode, bytes);
+        self.data.insert(inode_key(inode.inode), bytes);
     }
 
     // Check whether a file should be removed from storage. Should be called after decrementing
     // the link count, or closing a file handle
     fn gc_inode(&mut self, inode: &InodeAttributes) -> bool {
         if inode.hardlinks == 0 && inode.open_file_handles == 0 {
-            self.inodes.remove(inode_key(inode.inode));
-            self.data.remove(&inode.inode);
+            self.data.remove(inode_key(inode.inode));
+            self.data.remove_prefix(content_prefix(inode.inode));
 
             return true;
         }
 
         return false;
+    }
+
+    fn file_len(&self, inode: Inode) -> Option<u64> {
+        let tree = self.data.filter_prefix(content_prefix(inode));
+        if let Some((k, v)) = tree.last_entry(vec![]) {
+            let page_offset = u64::from_be_bytes(k[12..].try_into().unwrap());
+            let page_len = v.len() as u64;
+            Some(page_offset + page_len)
+        } else {
+            None
+        }
     }
 
     fn truncate(
@@ -446,8 +520,30 @@ impl Inner {
             return Err(libc::EACCES);
         }
 
-        if let Some(content) = self.data.get_mut(&inode) {
-            content.truncate(usize::try_from(new_length).unwrap())
+        if let Some(len) = self.file_len(inode) {
+            #[allow(clippy::comparison_chain)]
+            if len > new_length {
+                let (first, full, last) = pages_from_range(new_length..len, 4096);
+                // truncate the first page
+                if let Some((first_page, range)) = first {
+                    let mut buf = [0u8; 4096];
+                    let len = self.read_page(inode, first_page, &mut buf);
+                    self.write_page(inode, first_page, &buf[..range.start.min(len)]);
+                }
+                // remove all full pages
+                for page in full {
+                    self.data.remove(content_key(inode, page));
+                }
+                // remove partial last page
+                if let Some((last_page, _)) = last {
+                    self.data.remove(content_key(inode, last_page));
+                }
+            } else if len < new_length {
+                let t = vec![0u8; (new_length - len) as usize];
+                self.write_range(inode, len, &t);
+            } else {
+                // nothing to do
+            }
         }
 
         let now = time_now();
@@ -763,8 +859,8 @@ impl Filesystem for RadixFS {
     fn readlink(&mut self, _req: &Request, inode: u64, reply: ReplyData) {
         debug!("readlink() called on {:?}", inode);
         let inner = self.inner.lock();
-        if let Some(file) = inner.data.get(&inode) {
-            reply.data(file);
+        if let Some(file) = inner.data.get(content_key(inode, 0)) {
+            reply.data(file.as_ref());
         } else {
             reply.error(libc::ENOENT);
         }
@@ -842,7 +938,7 @@ impl Filesystem for RadixFS {
             xattrs: Default::default(),
         };
         inner.write_inode(&attrs);
-        inner.data.insert(inode, Vec::new());
+        inner.write_all(inode, &[]);
 
         if as_file_kind(mode) == FileKind::Directory {
             let mut entries = BTreeMap::new();
@@ -1112,11 +1208,7 @@ impl Filesystem for RadixFS {
             return;
         }
         inner.write_inode(&attrs);
-
-        self.inner
-            .lock()
-            .data
-            .insert(inode, link.as_os_str().as_bytes().to_vec());
+        inner.write_all(inode, link.as_os_str().as_bytes());
         reply.entry(&Duration::new(0, 0), &attrs.into(), 0);
     }
 
@@ -1420,7 +1512,7 @@ impl Filesystem for RadixFS {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        info!(
+        println!(
             "read() called on {:?} offset={:?} size={:?}",
             inode, offset, size
         );
@@ -1431,15 +1523,30 @@ impl Filesystem for RadixFS {
             return;
         }
 
-        if let Some(file) = inner.data.get(&inode) {
-            let file_size = file.len() as u64;
-            // Could underflow if file length is less than local_start
-            let read_size = min(size, file_size.saturating_sub(offset as u64) as u32);
-            let offset = usize::try_from(offset).unwrap();
-            reply.data(&file.as_slice()[offset..offset + (read_size as usize)]);
-        } else {
+        if !inner.data.has_prefix(content_prefix(inode)) {
             reply.error(libc::ENOENT);
+            return;
         }
+
+        let range = offset as u64..offset as u64 + size as u64;
+        let (first, full, last) = pages_from_range(range, 4096);
+        let mut t = [0u8; 4096];
+        let mut res = Vec::<u8>::with_capacity(size as usize);
+        if let Some((page, range)) = first {
+            let _ = inner.read_page(inode, page, &mut t);
+            res.extend_from_slice(&t[range]);
+        }
+        if !full.is_empty() {
+            for page in full {
+                let _ = inner.read_page(inode, page, &mut t);
+                res.extend_from_slice(&t);
+            }
+        }
+        if let Some((page, range)) = last {
+            let _ = inner.read_page(inode, page, &mut t);
+            res.extend_from_slice(&t[range]);
+        }
+        reply.data(&res);
     }
 
     fn write(
@@ -1454,7 +1561,12 @@ impl Filesystem for RadixFS {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        info!("write() called with {:?} size={:?}", inode, data.len());
+        println!(
+            "write() called with {:?} offset={} size={:?}",
+            inode,
+            offset,
+            data.len()
+        );
         assert!(offset >= 0);
         let mut inner = self.inner.lock();
         if !inner.check_file_handle_write(fh) {
@@ -1462,26 +1574,15 @@ impl Filesystem for RadixFS {
             return;
         }
 
-        let now = time_now();
-        if let Some(file) = inner.data.get_mut(&inode) {
-            let offset = usize::try_from(offset).unwrap();
-            if file.len() < offset + data.len() {
-                file.extend(std::iter::repeat(0u8).take(offset + data.len() - file.len()));
-            }
-            file[offset..offset + data.len()].copy_from_slice(data);
-
+        if inner.data.has_prefix(content_prefix(inode)) {
+            let now = time_now();
+            inner.write_range(inode, offset.try_into().unwrap(), data);
             let mut attrs = inner.get_inode(inode).unwrap();
             attrs.last_metadata_changed = now;
             attrs.last_modified = now;
             if data.len() + offset as usize > attrs.size as usize {
                 attrs.size = (data.len() + offset as usize) as u64;
             }
-            // #[cfg(feature = "abi-7-31")]
-            // if flags & FUSE_WRITE_KILL_PRIV as i32 != 0 {
-            //     clear_suid_sgid(&mut attrs);
-            // }
-            // XXX: In theory we should only need to do this when WRITE_KILL_PRIV is set for 7.31+
-            // However, xfstests fail in that case
             clear_suid_sgid(&mut attrs);
             inner.write_inode(&attrs);
 
@@ -1815,7 +1916,7 @@ impl Filesystem for RadixFS {
             xattrs: Default::default(),
         };
         inner.write_inode(&attrs);
-        inner.data.insert(inode, Vec::new());
+        inner.write_all(inode, &[]);
 
         if as_file_kind(mode) == FileKind::Directory {
             let mut entries = BTreeMap::new();
@@ -1869,6 +1970,7 @@ impl Filesystem for RadixFS {
         }
     }
 
+    #[allow(unused_variables, unused_mut)]
     fn copy_file_range(
         &mut self,
         _req: &Request<'_>,
@@ -1882,7 +1984,7 @@ impl Filesystem for RadixFS {
         _flags: u32,
         reply: ReplyWrite,
     ) {
-        debug!(
+        println!(
             "copy_file_range() called with src ({}, {}, {}) dest ({}, {}, {}) size={}",
             src_fh, src_inode, src_offset, dest_fh, dest_inode, dest_offset, size
         );
@@ -1901,27 +2003,28 @@ impl Filesystem for RadixFS {
         let size = usize::try_from(size).unwrap();
 
         let mut inner = self.inner.lock();
-        if let Some(src_file) = inner.data.get(&src_inode) {
-            let file_size = src_file.len();
-            // Could underflow if file length is less than local_start
-            let read_size = min(size, file_size.saturating_sub(src_offset));
-            let tmp = src_file[src_offset..src_offset + read_size].to_vec();
+        if inner.data.has_prefix(content_prefix(src_inode)) {
+            // todo!();
+            // let file_size = src_file.len();
+            // // Could underflow if file length is less than local_start
+            // let read_size = min(size, file_size.saturating_sub(src_offset));
+            // let tmp = src_file[src_offset..src_offset + read_size].to_vec();
 
-            if let Some(dest_file) = inner.data.get_mut(&dest_inode) {
-                dest_file[dest_offset..dest_offset + read_size].copy_from_slice(&tmp);
+            // if let Some(dest_file) = inner.data.get_mut(&dest_inode) {
+            //     dest_file[dest_offset..dest_offset + read_size].copy_from_slice(&tmp);
 
-                let mut attrs = inner.get_inode(dest_inode).unwrap();
-                attrs.last_metadata_changed = now;
-                attrs.last_modified = now;
-                if inner.data.len() + dest_offset as usize > attrs.size as usize {
-                    attrs.size = (inner.data.len() + dest_offset as usize) as u64;
-                }
-                inner.write_inode(&attrs);
+            //     let mut attrs = inner.get_inode(dest_inode).unwrap();
+            //     attrs.last_metadata_changed = now;
+            //     attrs.last_modified = now;
+            //     if inner.data.len() + dest_offset as usize > attrs.size as usize {
+            //         attrs.size = (inner.data.len() + dest_offset as usize) as u64;
+            //     }
+            //     inner.write_inode(&attrs);
 
-                reply.written(inner.data.len() as u32);
-            } else {
-                reply.error(libc::EBADF);
-            }
+            //     reply.written(inner.data.len() as u32);
+            // } else {
+            //     reply.error(libc::EBADF);
+            // }
         } else {
             reply.error(libc::ENOENT);
         }
@@ -1997,16 +2100,6 @@ fn get_groups(_pid: u32) -> Vec<u32> {
     vec![]
 }
 
-fn fuse_allow_other_enabled() -> io::Result<bool> {
-    let file = File::open("/etc/fuse.conf")?;
-    for line in BufReader::new(file).lines() {
-        if line?.trim_start().starts_with("user_allow_other") {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 fn main() {
     let matches = Command::new("radixfs")
         .version(crate_version!())
@@ -2042,13 +2135,6 @@ fn main() {
 
     let mut options = vec![MountOption::FSName("fuser".to_string())];
     options.push(MountOption::AutoUnmount);
-    if let Ok(enabled) = fuse_allow_other_enabled() {
-        if enabled {
-            options.push(MountOption::AllowOther);
-        }
-    } else {
-        eprintln!("Unable to read /etc/fuse.conf");
-    }
 
     let mountpoint: String = matches
         .value_of("mount-point")
