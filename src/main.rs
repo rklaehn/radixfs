@@ -10,11 +10,14 @@ use fuser::{
 use log::{debug, info, warn};
 use log::{error, LevelFilter};
 use parking_lot::Mutex;
+use radixdb::store::{BlobStore, PagedFileStore};
 use radixdb::RadixTree;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsStr;
+use std::fmt::Display;
+use std::fs::{File, OpenOptions};
 use std::io::{Cursor, ErrorKind};
 use std::ops::Range;
 use std::os::raw::c_int;
@@ -66,7 +69,7 @@ enum XattrNamespace {
     User,
 }
 
-fn parse_xattr_namespace(key: &[u8]) -> Result<XattrNamespace, c_int> {
+fn parse_xattr_namespace(key: &[u8]) -> std::result::Result<XattrNamespace, c_int> {
     let user = b"user.";
     if key.len() < user.len() {
         return Err(libc::ENOTSUP);
@@ -123,7 +126,7 @@ fn xattr_access_check(
     access_mask: i32,
     inode_attrs: &InodeAttributes,
     request: &Request<'_>,
-) -> Result<(), c_int> {
+) -> std::result::Result<(), c_int> {
     match parse_xattr_namespace(key)? {
         XattrNamespace::Security => {
             if access_mask != libc::R_OK && request.uid() != 0 {
@@ -240,12 +243,42 @@ struct RadixFS {
 }
 
 impl RadixFS {
-    fn new() -> RadixFS {
-        RadixFS {
-            inner: Default::default(),
-        }
+    fn open(file: File) -> Result<RadixFS> {
+        let store = PagedFileStore::new(file, 1024 * 1024)?;
+        let id = store.last_id();
+        let data = RadixTree::try_load(store, id.as_ref())?;
+        Ok(RadixFS {
+            inner: Arc::new(Mutex::new(Inner {
+                next_file_handle: 0,
+                data,
+            })),
+        })
     }
 }
+
+fn error(code: c_int) -> anyhow::Error {
+    anyhow::Error::new(IOError(code))
+}
+
+fn error_code(error: anyhow::Error) -> c_int {
+    if let Some(error) = error.downcast_ref::<IOError>() {
+        error.0
+    } else {
+        // return a generic io error
+        libc::EIO
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IOError(c_int);
+
+impl Display for IOError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IOError({})", self.0)
+    }
+}
+
+impl std::error::Error for IOError {}
 
 const fn inode_prefix() -> [u8; 4] {
     *b"inod"
@@ -341,50 +374,74 @@ fn test_pages_from_range() {
     assert_eq!(pages_from_range(1..30, 10), (Some((0, 1..10)), 1..3, None));
 }
 
-#[derive(Debug, Default, Clone)]
+type Result<T> = anyhow::Result<T>;
+
+#[derive(Debug, Clone)]
 struct Inner {
     next_file_handle: u64,
-    data: RadixTree,
+    data: RadixTree<PagedFileStore>,
+}
+
+macro_rules! check_error {
+    ($reply:ident, $e:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(e) => {
+                $reply.error(error_code(e));
+                return;
+            }
+        }
+    };
 }
 
 impl Inner {
-    fn read_page(&self, inode: Inode, page: u64, buf: &mut [u8]) -> usize {
+    fn store(&self) -> &PagedFileStore {
+        RadixTree::store(&self.data)
+    }
+
+    fn read_page(&self, inode: Inode, page: u64, buf: &mut [u8]) -> Result<usize> {
         println!("read_page {} {} {}", inode, page, buf.len());
-        if let Some(page) = self.data.get(content_key(inode, page)) {
-            let len = buf.len().min(page.len());
-            buf[..len].copy_from_slice(&page[..len]);
-            len
-        } else {
-            0
-        }
+        Ok(
+            if let Some(page) = self.data.try_get(content_key(inode, page))? {
+                let page = page.load(self.store())?;
+                let len = buf.len().min(page.len());
+                buf[..len].copy_from_slice(&page[..len]);
+                len
+            } else {
+                0
+            },
+        )
     }
 
-    fn write_page(&mut self, inode: Inode, page: u64, data: &[u8]) {
+    fn write_page(&mut self, inode: Inode, page: u64, data: &[u8]) -> Result<()> {
         println!("write_page {} {} {}", inode, page, data.len());
-        self.data.insert(content_key(inode, page), data);
+        self.data.try_insert(content_key(inode, page), data)?;
+        Ok(())
     }
 
-    fn read_all(&self, inode: Inode) -> Option<Vec<u8>> {
+    fn read_all(&self, inode: Inode) -> Result<Option<Vec<u8>>> {
         let mut res = None;
-        for (_, value) in self.data.scan_prefix(content_prefix(inode)) {
+        for elem in self.data.try_scan_prefix(content_prefix(inode))? {
+            let (_, value) = elem?;
+            let value = value.load(self.store())?;
             res.get_or_insert(Vec::new())
                 .extend_from_slice(value.as_ref());
         }
         debug!("read_all {} {:?}", inode, res);
-        res
+        Ok(res)
     }
 
-    fn write_range(&mut self, inode: Inode, offset: u64, data: &[u8]) {
+    fn write_range(&mut self, inode: Inode, offset: u64, data: &[u8]) -> Result<()> {
         let write_range = offset..offset + (u64::try_from(data.len()).unwrap());
         let (first, full, last) = pages_from_range(write_range, 4096);
         let mut t = [0u8; 4096];
         let mut d = data;
         // write first incomplete page
         if let Some((page, range)) = first {
-            let len = self.read_page(inode, page, &mut t);
+            let len = self.read_page(inode, page, &mut t)?;
             let (curr, rest) = d.split_at(range.len());
             t[range.clone()].copy_from_slice(curr);
-            self.write_page(inode, page, &t[..len.max(range.end)]);
+            self.write_page(inode, page, &t[..len.max(range.end)])?;
             d = rest;
         }
         // write full pages
@@ -392,39 +449,41 @@ impl Inner {
             for page in full {
                 let (curr, rest) = d.split_at(4096);
                 t.copy_from_slice(curr);
-                self.write_page(inode, page, &t);
+                self.write_page(inode, page, &t)?;
                 d = rest;
             }
         }
         // write last incomplete page
         if let Some((page, range)) = last {
-            let len = self.read_page(inode, page, &mut t);
+            let len = self.read_page(inode, page, &mut t)?;
             let (curr, rest) = d.split_at(range.len());
             t[range.clone()].copy_from_slice(curr);
-            self.write_page(inode, page, &t[..len.max(range.end)]);
+            self.write_page(inode, page, &t[..len.max(range.end)])?;
             d = rest;
         }
         assert!(d.is_empty());
+        Ok(())
     }
 
-    fn write_all(&mut self, inode: Inode, data: &[u8]) {
-        self.data.remove_prefix(content_prefix(inode));
-        self.write_range(inode, 0, data);
+    fn write_all(&mut self, inode: Inode, data: &[u8]) -> Result<()> {
+        self.data.try_remove_prefix(content_prefix(inode))?;
+        self.write_range(inode, 0, data)?;
+        Ok(())
     }
 
     fn creation_mode(&self, mode: u32) -> u16 {
         (mode & !(libc::S_ISUID | libc::S_ISGID) as u32) as u16
     }
 
-    fn allocate_next_inode(&self) -> Inode {
-        let inodes = self.data.filter_prefix(inode_prefix());
-        let current_inode = if let Some((k, _)) = inodes.last_entry(vec![]) {
-            u64::from_be_bytes(k[4..].try_into().unwrap())
+    fn allocate_next_inode(&self) -> Result<Inode> {
+        let inodes = self.data.try_filter_prefix(inode_prefix(), &[])?;
+        let current_inode = if let Some((k, _)) = inodes.try_last_entry(vec![])? {
+            u64::from_be_bytes(k.try_into().unwrap())
         } else {
             fuser::FUSE_ROOT_ID
         };
         info!("allocate_next_inode {}", current_inode + 1);
-        current_inode + 1
+        Ok(current_inode + 1)
     }
 
     fn allocate_next_file_handle(&mut self, read: bool, write: bool) -> u64 {
@@ -450,52 +509,68 @@ impl Inner {
         (file_handle & FILE_HANDLE_WRITE_BIT) != 0
     }
 
-    fn get_directory_content(&self, inode: Inode) -> Result<DirectoryDescriptor, c_int> {
-        if let Some(data) = self.read_all(inode) {
-            Ok(bincode::deserialize_from(Cursor::new(data)).unwrap())
+    fn get_directory_content(&self, inode: Inode) -> Result<DirectoryDescriptor> {
+        if let Some(data) = self.read_all(inode)? {
+            Ok(bincode::deserialize_from(Cursor::new(data))?)
         } else {
-            Err(libc::ENOENT)
+            Err(error(libc::ENOENT))
         }
     }
 
-    fn write_directory_content(&mut self, inode: Inode, entries: DirectoryDescriptor) {
+    fn write_directory_content(
+        &mut self,
+        inode: Inode,
+        entries: DirectoryDescriptor,
+    ) -> Result<()> {
         let data = bincode::serialize(&entries).unwrap();
-        self.write_all(inode, &data);
+        self.write_all(inode, &data)
     }
 
-    fn get_inode(&self, inode: Inode) -> Result<InodeAttributes, c_int> {
+    fn get_inode(&self, inode: Inode) -> Result<InodeAttributes> {
         info!("get_inode({})", inode);
-        if let Some(value) = self.data.get(&inode_key(inode)) {
+        if let Some(value) = self.data.try_get(&inode_key(inode))? {
+            let value = value.load(self.store())?;
             let attrs: InodeAttributes = bincode::deserialize(value.as_ref()).unwrap();
             Ok(attrs)
         } else {
-            Err(libc::ENOENT)
+            Err(error(libc::ENOENT))
         }
     }
 
-    fn write_inode(&mut self, inode: &InodeAttributes) {
+    fn write_inode(&mut self, inode: &InodeAttributes) -> Result<()> {
         info!("write_inode({:?})", inode);
         let bytes = bincode::serialize(inode).unwrap();
-        self.data.insert(inode_key(inode.inode), bytes);
+        self.data.try_insert(inode_key(inode.inode), bytes)?;
+        Ok(())
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        self.data.try_reattach()?;
+        self.store().sync()?;
+        Ok(())
     }
 
     // Check whether a file should be removed from storage. Should be called after decrementing
     // the link count, or closing a file handle
-    fn gc_inode(&mut self, inode: &InodeAttributes) -> bool {
+    fn gc_inode(&mut self, inode: &InodeAttributes) -> Result<bool> {
         if inode.hardlinks == 0 && inode.open_file_handles == 0 {
-            self.data.remove(inode_key(inode.inode));
-            self.data.remove_prefix(content_prefix(inode.inode));
+            self.data.try_remove(inode_key(inode.inode))?;
+            self.data.try_remove_prefix(content_prefix(inode.inode))?;
 
-            return true;
+            return Ok(true);
         }
 
-        return false;
+        return Ok(false);
     }
 
     fn file_len(&self, inode: Inode) -> Option<u64> {
-        let tree = self.data.filter_prefix(content_prefix(inode));
-        if let Some((k, v)) = tree.last_entry(vec![]) {
-            let page_offset = u64::from_be_bytes(k[12..].try_into().unwrap());
+        let tree = self
+            .data
+            .try_filter_prefix(content_prefix(inode), &[])
+            .unwrap();
+        if let Some((k, v)) = tree.try_last_entry(vec![]).unwrap() {
+            let v = v.load(self.store()).unwrap();
+            let page_offset = u64::from_be_bytes(k.try_into().unwrap());
             let page_len = v.len() as u64;
             Some(page_offset + page_len)
         } else {
@@ -509,15 +584,15 @@ impl Inner {
         new_length: u64,
         uid: u32,
         gid: u32,
-    ) -> Result<InodeAttributes, c_int> {
+    ) -> Result<InodeAttributes> {
         if new_length > MAX_FILE_SIZE {
-            return Err(libc::EFBIG);
+            return Err(error(libc::EFBIG));
         }
 
         let mut attrs = self.get_inode(inode)?;
 
         if !check_access(attrs.uid, attrs.gid, attrs.mode, uid, gid, libc::W_OK) {
-            return Err(libc::EACCES);
+            return Err(error(libc::EACCES));
         }
 
         if let Some(len) = self.file_len(inode) {
@@ -527,20 +602,20 @@ impl Inner {
                 // truncate the first page
                 if let Some((first_page, range)) = first {
                     let mut buf = [0u8; 4096];
-                    let len = self.read_page(inode, first_page, &mut buf);
-                    self.write_page(inode, first_page, &buf[..range.start.min(len)]);
+                    let len = self.read_page(inode, first_page, &mut buf)?;
+                    self.write_page(inode, first_page, &buf[..range.start.min(len)])?;
                 }
                 // remove all full pages
                 for page in full {
-                    self.data.remove(content_key(inode, page));
+                    self.data.try_remove(content_key(inode, page))?;
                 }
                 // remove partial last page
                 if let Some((last_page, _)) = last {
-                    self.data.remove(content_key(inode, last_page));
+                    self.data.try_remove(content_key(inode, last_page))?;
                 }
             } else if len < new_length {
                 let t = vec![0u8; (new_length - len) as usize];
-                self.write_range(inode, len, &t);
+                self.write_range(inode, len, &t)?;
             } else {
                 // nothing to do
             }
@@ -554,17 +629,17 @@ impl Inner {
         // Clear SETUID & SETGID on truncate
         clear_suid_sgid(&mut attrs);
 
-        self.write_inode(&attrs);
+        self.write_inode(&attrs)?;
 
         Ok(attrs)
     }
 
-    fn lookup_name(&self, parent: u64, name: &OsStr) -> Result<InodeAttributes, c_int> {
+    fn lookup_name(&self, parent: u64, name: &OsStr) -> Result<InodeAttributes> {
         let entries = self.get_directory_content(parent)?;
         if let Some((inode, _)) = entries.get(name.as_bytes()) {
             return self.get_inode(*inode);
         } else {
-            return Err(libc::ENOENT);
+            return Err(error(libc::ENOENT));
         }
     }
 
@@ -575,9 +650,9 @@ impl Inner {
         name: &OsStr,
         inode: u64,
         kind: FileKind,
-    ) -> Result<(), c_int> {
+    ) -> Result<()> {
         if self.lookup_name(parent, name).is_ok() {
-            return Err(libc::EEXIST);
+            return Err(error(libc::EEXIST));
         }
 
         let mut parent_attrs = self.get_inode(parent)?;
@@ -590,16 +665,16 @@ impl Inner {
             req.gid(),
             libc::W_OK,
         ) {
-            return Err(libc::EACCES);
+            return Err(error(libc::EEXIST));
         }
         let now = time_now();
         parent_attrs.last_modified = now;
         parent_attrs.last_metadata_changed = now;
-        self.write_inode(&parent_attrs);
+        self.write_inode(&parent_attrs)?;
 
         let mut entries = self.get_directory_content(parent).unwrap();
         entries.insert(name.as_bytes().to_vec(), (inode, kind));
-        self.write_directory_content(parent, entries);
+        self.write_directory_content(parent, entries)?;
 
         Ok(())
     }
@@ -610,7 +685,7 @@ impl Filesystem for RadixFS {
         &mut self,
         _req: &Request,
         #[allow(unused_variables)] config: &mut KernelConfig,
-    ) -> Result<(), c_int> {
+    ) -> std::result::Result<(), c_int> {
         let mut inner = self.inner.lock();
         let now = time_now();
         if inner.get_inode(FUSE_ROOT_ID).is_err() {
@@ -629,10 +704,12 @@ impl Filesystem for RadixFS {
                 gid: 0,
                 xattrs: Default::default(),
             };
-            inner.write_inode(&root);
+            inner.write_inode(&root).map_err(error_code)?;
             let mut entries = BTreeMap::new();
             entries.insert(b".".to_vec(), (FUSE_ROOT_ID, FileKind::Directory));
-            inner.write_directory_content(FUSE_ROOT_ID, entries);
+            inner
+                .write_directory_content(FUSE_ROOT_ID, entries)
+                .map_err(error_code)?;
         }
         Ok(())
     }
@@ -643,7 +720,7 @@ impl Filesystem for RadixFS {
             return;
         }
         let inner = self.inner.lock();
-        let parent_attrs = inner.get_inode(parent).unwrap();
+        let parent_attrs = check_error!(reply, inner.get_inode(parent));
         if !check_access(
             parent_attrs.uid,
             parent_attrs.gid,
@@ -656,20 +733,16 @@ impl Filesystem for RadixFS {
             return;
         }
 
-        match inner.lookup_name(parent, name) {
-            Ok(attrs) => reply.entry(&Duration::new(0, 0), &attrs.into(), 0),
-            Err(error_code) => reply.error(error_code),
-        }
+        let attrs = check_error!(reply, inner.lookup_name(parent, name));
+        reply.entry(&Duration::new(0, 0), &attrs.into(), 0);
     }
 
     fn forget(&mut self, _req: &Request, _ino: u64, _nlookup: u64) {}
 
     fn getattr(&mut self, _req: &Request, inode: u64, reply: ReplyAttr) {
         let inner = self.inner.lock();
-        match inner.get_inode(inode) {
-            Ok(attrs) => reply.attr(&Duration::new(0, 0), &attrs.into()),
-            Err(error_code) => reply.error(error_code),
-        }
+        let attrs = check_error!(reply, inner.get_inode(inode));
+        reply.attr(&Duration::new(0, 0), &attrs.into());
     }
 
     fn setattr(
@@ -691,13 +764,7 @@ impl Filesystem for RadixFS {
         reply: ReplyAttr,
     ) {
         let mut inner = self.inner.lock();
-        let mut attrs = match inner.get_inode(inode) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
+        let mut attrs = check_error!(reply, inner.get_inode(inode));
 
         let now = time_now();
         if let Some(mode) = mode {
@@ -717,7 +784,7 @@ impl Filesystem for RadixFS {
                 attrs.mode = mode as u16;
             }
             attrs.last_metadata_changed = now;
-            inner.write_inode(&attrs);
+            check_error!(reply, inner.write_inode(&attrs));
             reply.attr(&Duration::new(0, 0), &attrs.into());
             return;
         }
@@ -764,7 +831,7 @@ impl Filesystem for RadixFS {
                 }
             }
             attrs.last_metadata_changed = now;
-            inner.write_inode(&attrs);
+            check_error!(reply, inner.write_inode(&attrs));
             reply.attr(&Duration::new(0, 0), &attrs.into());
             return;
         }
@@ -777,17 +844,13 @@ impl Filesystem for RadixFS {
                 // with W_OK will never fail to truncate, even if the file has been subsequently
                 // chmod'ed
                 if inner.check_file_handle_write(handle) {
-                    if let Err(error_code) = inner.truncate(inode, size, 0, 0) {
-                        reply.error(error_code);
-                        return;
-                    }
+                    check_error!(reply, inner.truncate(inode, size, 0, 0));
                 } else {
                     reply.error(libc::EACCES);
                     return;
                 }
-            } else if let Err(error_code) = inner.truncate(inode, size, req.uid(), req.gid()) {
-                reply.error(error_code);
-                return;
+            } else {
+                check_error!(reply, inner.truncate(inode, size, req.uid(), req.gid()));
             }
         }
 
@@ -819,7 +882,7 @@ impl Filesystem for RadixFS {
                 Now => now,
             };
             attrs.last_metadata_changed = now;
-            inner.write_inode(&attrs);
+            check_error!(reply, inner.write_inode(&attrs));
         }
         if let Some(mtime) = mtime {
             debug!("utimens() called with {:?}, mtime={:?}", inode, mtime);
@@ -848,10 +911,10 @@ impl Filesystem for RadixFS {
                 Now => now,
             };
             attrs.last_metadata_changed = now;
-            inner.write_inode(&attrs);
+            check_error!(reply, inner.write_inode(&attrs));
         }
 
-        let attrs = inner.get_inode(inode).unwrap();
+        let attrs = check_error!(reply, inner.get_inode(inode));
         reply.attr(&Duration::new(0, 0), &attrs.into());
         return;
     }
@@ -859,7 +922,8 @@ impl Filesystem for RadixFS {
     fn readlink(&mut self, _req: &Request, inode: u64, reply: ReplyData) {
         debug!("readlink() called on {:?}", inode);
         let inner = self.inner.lock();
-        if let Some(file) = inner.data.get(content_key(inode, 0)) {
+        if let Some(file) = inner.data.try_get(content_key(inode, 0)).unwrap() {
+            let file = file.load(inner.store()).unwrap();
             reply.data(file.as_ref());
         } else {
             reply.error(libc::ENOENT);
@@ -894,13 +958,7 @@ impl Filesystem for RadixFS {
             return;
         }
 
-        let mut parent_attrs = match inner.get_inode(parent) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
+        let mut parent_attrs = check_error!(reply, inner.get_inode(parent));
 
         if !check_access(
             parent_attrs.uid,
@@ -916,13 +974,13 @@ impl Filesystem for RadixFS {
         let now = time_now();
         parent_attrs.last_modified = now;
         parent_attrs.last_metadata_changed = now;
-        inner.write_inode(&parent_attrs);
+        check_error!(reply, inner.write_inode(&parent_attrs));
 
         if req.uid() != 0 {
             mode &= !(libc::S_ISUID | libc::S_ISGID) as u32;
         }
 
-        let inode = inner.allocate_next_inode();
+        let inode = check_error!(reply, inner.allocate_next_inode());
         let attrs = InodeAttributes {
             inode,
             open_file_handles: 0,
@@ -937,19 +995,19 @@ impl Filesystem for RadixFS {
             gid: creation_gid(&parent_attrs, req.gid()),
             xattrs: Default::default(),
         };
-        inner.write_inode(&attrs);
-        inner.write_all(inode, &[]);
+        check_error!(reply, inner.write_inode(&attrs));
+        inner.write_all(inode, &[]).unwrap();
 
         if as_file_kind(mode) == FileKind::Directory {
             let mut entries = BTreeMap::new();
             entries.insert(b".".to_vec(), (inode, FileKind::Directory));
             entries.insert(b"..".to_vec(), (parent, FileKind::Directory));
-            inner.write_directory_content(inode, entries);
+            check_error!(reply, inner.write_directory_content(inode, entries));
         }
 
-        let mut entries = inner.get_directory_content(parent).unwrap();
+        let mut entries = check_error!(reply, inner.get_directory_content(parent));
         entries.insert(name.as_bytes().to_vec(), (inode, attrs.kind));
-        inner.write_directory_content(parent, entries);
+        check_error!(reply, inner.write_directory_content(parent, entries));
 
         // TODO: implement flags
         reply.entry(&Duration::new(0, 0), &attrs.into(), 0);
@@ -971,13 +1029,7 @@ impl Filesystem for RadixFS {
             return;
         }
 
-        let mut parent_attrs = match inner.get_inode(parent) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
+        let mut parent_attrs = check_error!(reply, inner.get_inode(parent));
 
         if !check_access(
             parent_attrs.uid,
@@ -993,7 +1045,7 @@ impl Filesystem for RadixFS {
         let now = time_now();
         parent_attrs.last_modified = now;
         parent_attrs.last_metadata_changed = now;
-        inner.write_inode(&parent_attrs);
+        check_error!(reply, inner.write_inode(&parent_attrs));
 
         if req.uid() != 0 {
             mode &= !(libc::S_ISUID | libc::S_ISGID) as u32;
@@ -1002,7 +1054,7 @@ impl Filesystem for RadixFS {
             mode |= libc::S_ISGID as u32;
         }
 
-        let inode = inner.allocate_next_inode();
+        let inode = check_error!(reply, inner.allocate_next_inode());
         let attrs = InodeAttributes {
             inode,
             open_file_handles: 0,
@@ -1017,16 +1069,16 @@ impl Filesystem for RadixFS {
             gid: creation_gid(&parent_attrs, req.gid()),
             xattrs: Default::default(),
         };
-        inner.write_inode(&attrs);
+        check_error!(reply, inner.write_inode(&attrs));
 
         let mut entries = BTreeMap::new();
         entries.insert(b".".to_vec(), (inode, FileKind::Directory));
         entries.insert(b"..".to_vec(), (parent, FileKind::Directory));
-        inner.write_directory_content(inode, entries);
+        check_error!(reply, inner.write_directory_content(inode, entries));
 
-        let mut entries = inner.get_directory_content(parent).unwrap();
+        let mut entries = check_error!(reply, inner.get_directory_content(parent));
         entries.insert(name.as_bytes().to_vec(), (inode, FileKind::Directory));
-        inner.write_directory_content(parent, entries);
+        check_error!(reply, inner.write_directory_content(parent, entries));
 
         reply.entry(&Duration::new(0, 0), &attrs.into(), 0);
     }
@@ -1034,21 +1086,8 @@ impl Filesystem for RadixFS {
     fn unlink(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         debug!("unlink() called with {:?} {:?}", parent, name);
         let mut inner = self.inner.lock();
-        let mut attrs = match inner.lookup_name(parent, name) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
-
-        let mut parent_attrs = match inner.get_inode(parent) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
+        let mut attrs = check_error!(reply, inner.lookup_name(parent, name));
+        let mut parent_attrs = check_error!(reply, inner.get_inode(parent));
 
         if !check_access(
             parent_attrs.uid,
@@ -1076,16 +1115,16 @@ impl Filesystem for RadixFS {
         let now = time_now();
         parent_attrs.last_metadata_changed = now;
         parent_attrs.last_modified = now;
-        inner.write_inode(&parent_attrs);
+        check_error!(reply, inner.write_inode(&parent_attrs));
 
         attrs.hardlinks -= 1;
         attrs.last_metadata_changed = now;
-        inner.write_inode(&attrs);
-        inner.gc_inode(&attrs);
+        check_error!(reply, inner.write_inode(&attrs));
+        check_error!(reply, inner.gc_inode(&attrs));
 
-        let mut entries = inner.get_directory_content(parent).unwrap();
+        let mut entries = check_error!(reply, inner.get_directory_content(parent));
         entries.remove(name.as_bytes());
-        inner.write_directory_content(parent, entries);
+        check_error!(reply, inner.write_directory_content(parent, entries));
 
         reply.ok();
     }
@@ -1093,21 +1132,9 @@ impl Filesystem for RadixFS {
     fn rmdir(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         debug!("rmdir() called with {:?} {:?}", parent, name);
         let mut inner = self.inner.lock();
-        let mut attrs = match inner.lookup_name(parent, name) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
+        let mut attrs = check_error!(reply, inner.lookup_name(parent, name));
 
-        let mut parent_attrs = match inner.get_inode(parent) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
+        let mut parent_attrs = check_error!(reply, inner.get_inode(parent));
 
         // Directories always have a self and parent link
         if inner.get_directory_content(attrs.inode).unwrap().len() > 2 {
@@ -1139,16 +1166,16 @@ impl Filesystem for RadixFS {
         let now = time_now();
         parent_attrs.last_metadata_changed = now;
         parent_attrs.last_modified = now;
-        inner.write_inode(&parent_attrs);
+        check_error!(reply, inner.write_inode(&parent_attrs));
 
         attrs.hardlinks = 0;
         attrs.last_metadata_changed = now;
-        inner.write_inode(&attrs);
-        inner.gc_inode(&attrs);
+        check_error!(reply, inner.write_inode(&attrs));
+        check_error!(reply, inner.gc_inode(&attrs));
 
-        let mut entries = inner.get_directory_content(parent).unwrap();
+        let mut entries = check_error!(reply, inner.get_directory_content(parent));
         entries.remove(name.as_bytes());
-        inner.write_directory_content(parent, entries);
+        check_error!(reply, inner.write_directory_content(parent, entries));
 
         reply.ok();
     }
@@ -1163,13 +1190,7 @@ impl Filesystem for RadixFS {
     ) {
         debug!("symlink() called with {:?} {:?} {:?}", parent, name, link);
         let mut inner = self.inner.lock();
-        let mut parent_attrs = match inner.get_inode(parent) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
+        let mut parent_attrs = check_error!(reply, inner.get_inode(parent));
 
         if !check_access(
             parent_attrs.uid,
@@ -1185,9 +1206,9 @@ impl Filesystem for RadixFS {
         let now = time_now();
         parent_attrs.last_modified = now;
         parent_attrs.last_metadata_changed = now;
-        inner.write_inode(&parent_attrs);
+        check_error!(reply, inner.write_inode(&parent_attrs));
 
-        let inode = inner.allocate_next_inode();
+        let inode = check_error!(reply, inner.allocate_next_inode());
         let attrs = InodeAttributes {
             inode,
             open_file_handles: 0,
@@ -1203,12 +1224,12 @@ impl Filesystem for RadixFS {
             xattrs: Default::default(),
         };
 
-        if let Err(error_code) = inner.insert_link(req, parent, name, inode, FileKind::Symlink) {
-            reply.error(error_code);
-            return;
-        }
-        inner.write_inode(&attrs);
-        inner.write_all(inode, link.as_os_str().as_bytes());
+        check_error!(
+            reply,
+            inner.insert_link(req, parent, name, inode, FileKind::Symlink)
+        );
+        check_error!(reply, inner.write_inode(&attrs));
+        check_error!(reply, inner.write_all(inode, link.as_os_str().as_bytes()));
         reply.entry(&Duration::new(0, 0), &attrs.into(), 0);
     }
 
@@ -1223,21 +1244,8 @@ impl Filesystem for RadixFS {
         reply: ReplyEmpty,
     ) {
         let mut inner = self.inner.lock();
-        let mut inode_attrs = match inner.lookup_name(parent, name) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
-
-        let mut parent_attrs = match inner.get_inode(parent) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
+        let mut inode_attrs = check_error!(reply, inner.lookup_name(parent, name));
+        let mut parent_attrs = check_error!(reply, inner.get_inode(parent));
 
         if !check_access(
             parent_attrs.uid,
@@ -1261,13 +1269,7 @@ impl Filesystem for RadixFS {
             return;
         }
 
-        let mut new_parent_attrs = match inner.get_inode(new_parent) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
+        let mut new_parent_attrs = check_error!(reply, inner.get_inode(new_parent));
 
         if !check_access(
             new_parent_attrs.uid,
@@ -1380,7 +1382,7 @@ impl Filesystem for RadixFS {
         if let Ok(mut existing_inode_attrs) = inner.lookup_name(new_parent, new_name) {
             let mut entries = inner.get_directory_content(new_parent).unwrap();
             entries.remove(new_name.as_bytes());
-            inner.write_directory_content(new_parent, entries);
+            inner.write_directory_content(new_parent, entries).unwrap();
 
             if existing_inode_attrs.kind == FileKind::Directory {
                 existing_inode_attrs.hardlinks = 0;
@@ -1388,34 +1390,36 @@ impl Filesystem for RadixFS {
                 existing_inode_attrs.hardlinks -= 1;
             }
             existing_inode_attrs.last_metadata_changed = now;
-            inner.write_inode(&existing_inode_attrs);
-            inner.gc_inode(&existing_inode_attrs);
+            inner.write_inode(&existing_inode_attrs).unwrap();
+            inner.gc_inode(&existing_inode_attrs).unwrap();
         }
 
-        let mut entries = inner.get_directory_content(parent).unwrap();
+        let mut entries = check_error!(reply, inner.get_directory_content(parent));
         entries.remove(name.as_bytes());
-        inner.write_directory_content(parent, entries);
+        check_error!(reply, inner.write_directory_content(parent, entries));
 
         let mut entries = inner.get_directory_content(new_parent).unwrap();
         entries.insert(
             new_name.as_bytes().to_vec(),
             (inode_attrs.inode, inode_attrs.kind),
         );
-        inner.write_directory_content(new_parent, entries);
+        inner.write_directory_content(new_parent, entries).unwrap();
 
         parent_attrs.last_metadata_changed = now;
         parent_attrs.last_modified = now;
-        inner.write_inode(&parent_attrs);
+        check_error!(reply, inner.write_inode(&parent_attrs));
         new_parent_attrs.last_metadata_changed = now;
         new_parent_attrs.last_modified = now;
-        inner.write_inode(&new_parent_attrs);
+        inner.write_inode(&new_parent_attrs).unwrap();
         inode_attrs.last_metadata_changed = now;
-        inner.write_inode(&inode_attrs);
+        inner.write_inode(&inode_attrs).unwrap();
 
         if inode_attrs.kind == FileKind::Directory {
             let mut entries = inner.get_directory_content(inode_attrs.inode).unwrap();
             entries.insert(b"..".to_vec(), (new_parent, FileKind::Directory));
-            inner.write_directory_content(inode_attrs.inode, entries);
+            inner
+                .write_directory_content(inode_attrs.inode, entries)
+                .unwrap();
         }
 
         reply.ok();
@@ -1434,22 +1438,16 @@ impl Filesystem for RadixFS {
             inode, new_parent, new_name
         );
         let mut inner = self.inner.lock();
-        let mut attrs = match inner.get_inode(inode) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
+        let mut attrs = check_error!(reply, inner.get_inode(inode));
         let now = time_now();
-        if let Err(error_code) = inner.insert_link(req, new_parent, new_name, inode, attrs.kind) {
-            reply.error(error_code);
-        } else {
-            attrs.hardlinks += 1;
-            attrs.last_metadata_changed = now;
-            inner.write_inode(&attrs);
-            reply.entry(&Duration::new(0, 0), &attrs.into(), 0);
-        }
+        check_error!(
+            reply,
+            inner.insert_link(req, new_parent, new_name, inode, attrs.kind)
+        );
+        attrs.hardlinks += 1;
+        attrs.last_metadata_changed = now;
+        check_error!(reply, inner.write_inode(&attrs));
+        reply.entry(&Duration::new(0, 0), &attrs.into(), 0);
     }
 
     fn open(&mut self, req: &Request, inode: u64, flags: i32, reply: ReplyOpen) {
@@ -1478,27 +1476,23 @@ impl Filesystem for RadixFS {
             }
         };
 
-        match inner.get_inode(inode) {
-            Ok(mut attr) => {
-                if check_access(
-                    attr.uid,
-                    attr.gid,
-                    attr.mode,
-                    req.uid(),
-                    req.gid(),
-                    access_mask,
-                ) {
-                    attr.open_file_handles += 1;
-                    inner.write_inode(&attr);
-                    let open_flags = 0;
-                    reply.opened(inner.allocate_next_file_handle(read, write), open_flags);
-                } else {
-                    reply.error(libc::EACCES);
-                }
-                return;
-            }
-            Err(error_code) => reply.error(error_code),
+        let mut attr = check_error!(reply, inner.get_inode(inode));
+        if check_access(
+            attr.uid,
+            attr.gid,
+            attr.mode,
+            req.uid(),
+            req.gid(),
+            access_mask,
+        ) {
+            attr.open_file_handles += 1;
+            inner.write_inode(&attr).unwrap();
+            let open_flags = 0;
+            reply.opened(inner.allocate_next_file_handle(read, write), open_flags);
+        } else {
+            reply.error(libc::EACCES);
         }
+        return;
     }
 
     fn read(
@@ -1523,7 +1517,7 @@ impl Filesystem for RadixFS {
             return;
         }
 
-        if !inner.data.has_prefix(content_prefix(inode)) {
+        if !inner.data.try_has_prefix(content_prefix(inode)).unwrap() {
             reply.error(libc::ENOENT);
             return;
         }
@@ -1574,18 +1568,20 @@ impl Filesystem for RadixFS {
             return;
         }
 
-        if inner.data.has_prefix(content_prefix(inode)) {
+        if inner.data.try_has_prefix(content_prefix(inode)).unwrap() {
             let now = time_now();
-            inner.write_range(inode, offset.try_into().unwrap(), data);
-            let mut attrs = inner.get_inode(inode).unwrap();
+            inner
+                .write_range(inode, offset.try_into().unwrap(), data)
+                .unwrap();
+            let mut attrs = check_error!(reply, inner.get_inode(inode));
             attrs.last_metadata_changed = now;
             attrs.last_modified = now;
             if data.len() + offset as usize > attrs.size as usize {
                 attrs.size = (data.len() + offset as usize) as u64;
             }
             clear_suid_sgid(&mut attrs);
-            inner.write_inode(&attrs);
-
+            check_error!(reply, inner.write_inode(&attrs));
+            check_error!(reply, inner.sync());
             reply.written(data.len() as u32);
         } else {
             reply.error(libc::EBADF);
@@ -1605,7 +1601,7 @@ impl Filesystem for RadixFS {
         let mut inner = self.inner.lock();
         if let Ok(mut attrs) = inner.get_inode(inode) {
             attrs.open_file_handles -= 1;
-            inner.write_inode(&attrs);
+            check_error!(reply, inner.write_inode(&attrs));
         }
         reply.ok();
     }
@@ -1631,27 +1627,24 @@ impl Filesystem for RadixFS {
         };
         let mut inner = self.inner.lock();
 
-        match inner.get_inode(inode) {
-            Ok(mut attr) => {
-                if check_access(
-                    attr.uid,
-                    attr.gid,
-                    attr.mode,
-                    req.uid(),
-                    req.gid(),
-                    access_mask,
-                ) {
-                    attr.open_file_handles += 1;
-                    inner.write_inode(&attr);
-                    let open_flags = 0;
-                    reply.opened(inner.allocate_next_file_handle(read, write), open_flags);
-                } else {
-                    reply.error(libc::EACCES);
-                }
-                return;
-            }
-            Err(error_code) => reply.error(error_code),
+        let mut attr = check_error!(reply, inner.get_inode(inode));
+        if check_access(
+            attr.uid,
+            attr.gid,
+            attr.mode,
+            req.uid(),
+            req.gid(),
+            access_mask,
+        ) {
+            attr.open_file_handles += 1;
+            check_error!(reply, inner.write_inode(&attr));
+            check_error!(reply, inner.sync());
+            let open_flags = 0;
+            reply.opened(inner.allocate_next_file_handle(read, write), open_flags);
+        } else {
+            reply.error(libc::EACCES);
         }
+        return;
     }
 
     fn readdir(
@@ -1665,13 +1658,7 @@ impl Filesystem for RadixFS {
         debug!("readdir() called with {:?}", inode);
         assert!(offset >= 0);
         let inner = self.inner.lock();
-        let entries = match inner.get_directory_content(inode) {
-            Ok(entries) => entries,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
+        let entries = check_error!(reply, inner.get_directory_content(inode));
 
         for (index, entry) in entries.iter().skip(offset as usize).enumerate() {
             let (name, (inode, file_type)) = entry;
@@ -1703,7 +1690,7 @@ impl Filesystem for RadixFS {
         let mut inner = self.inner.lock();
         if let Ok(mut attrs) = inner.get_inode(inode) {
             attrs.open_file_handles -= 1;
-            inner.write_inode(&attrs);
+            check_error!(reply, inner.write_inode(&attrs));
         }
         reply.ok();
     }
@@ -1743,7 +1730,7 @@ impl Filesystem for RadixFS {
             let now = time_now();
             attrs.xattrs.insert(key.as_bytes().to_vec(), value.to_vec());
             attrs.last_metadata_changed = now;
-            inner.write_inode(&attrs);
+            check_error!(reply, inner.write_inode(&attrs));
             reply.ok();
         } else {
             reply.error(libc::EBADF);
@@ -1822,7 +1809,7 @@ impl Filesystem for RadixFS {
                 return;
             }
             attrs.last_metadata_changed = now;
-            inner.write_inode(&attrs);
+            check_error!(reply, inner.write_inode(&attrs));
             reply.ok();
         } else {
             reply.error(libc::EBADF);
@@ -1832,15 +1819,11 @@ impl Filesystem for RadixFS {
     fn access(&mut self, req: &Request, inode: u64, mask: i32, reply: ReplyEmpty) {
         debug!("access() called with {:?} {:?}", inode, mask);
         let inner = self.inner.lock();
-        match inner.get_inode(inode) {
-            Ok(attr) => {
-                if check_access(attr.uid, attr.gid, attr.mode, req.uid(), req.gid(), mask) {
-                    reply.ok();
-                } else {
-                    reply.error(libc::EACCES);
-                }
-            }
-            Err(error_code) => reply.error(error_code),
+        let attr = check_error!(reply, inner.get_inode(inode));
+        if check_access(attr.uid, attr.gid, attr.mode, req.uid(), req.gid(), mask) {
+            reply.ok();
+        } else {
+            reply.error(libc::EACCES);
         }
     }
 
@@ -1873,13 +1856,7 @@ impl Filesystem for RadixFS {
         };
 
         let now = time_now();
-        let mut parent_attrs = match inner.get_inode(parent) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
+        let mut parent_attrs = check_error!(reply, inner.get_inode(parent));
 
         if !check_access(
             parent_attrs.uid,
@@ -1894,13 +1871,13 @@ impl Filesystem for RadixFS {
         }
         parent_attrs.last_modified = now;
         parent_attrs.last_metadata_changed = now;
-        inner.write_inode(&parent_attrs);
+        check_error!(reply, inner.write_inode(&parent_attrs));
 
         if req.uid() != 0 {
             mode &= !(libc::S_ISUID | libc::S_ISGID) as u32;
         }
 
-        let inode = inner.allocate_next_inode();
+        let inode = check_error!(reply, inner.allocate_next_inode());
         let attrs = InodeAttributes {
             inode,
             open_file_handles: 1,
@@ -1915,19 +1892,19 @@ impl Filesystem for RadixFS {
             gid: creation_gid(&parent_attrs, req.gid()),
             xattrs: Default::default(),
         };
-        inner.write_inode(&attrs);
-        inner.write_all(inode, &[]);
+        check_error!(reply, inner.write_inode(&attrs));
+        check_error!(reply, inner.write_all(inode, &[]));
 
         if as_file_kind(mode) == FileKind::Directory {
             let mut entries = BTreeMap::new();
             entries.insert(b".".to_vec(), (inode, FileKind::Directory));
             entries.insert(b"..".to_vec(), (parent, FileKind::Directory));
-            inner.write_directory_content(inode, entries);
+            check_error!(reply, inner.write_directory_content(inode, entries));
         }
 
-        let mut entries = inner.get_directory_content(parent).unwrap();
+        let mut entries = check_error!(reply, inner.get_directory_content(parent));
         entries.insert(name.as_bytes().to_vec(), (inode, attrs.kind));
-        inner.write_directory_content(parent, entries);
+        check_error!(reply, inner.write_directory_content(parent, entries));
 
         // TODO: implement flags
         reply.created(
@@ -2003,7 +1980,11 @@ impl Filesystem for RadixFS {
         let size = usize::try_from(size).unwrap();
 
         let mut inner = self.inner.lock();
-        if inner.data.has_prefix(content_prefix(src_inode)) {
+        if inner
+            .data
+            .try_has_prefix(content_prefix(src_inode))
+            .unwrap()
+        {
             // todo!();
             // let file_size = src_file.len();
             // // Could underflow if file length is less than local_start
@@ -2100,7 +2081,7 @@ fn get_groups(_pid: u32) -> Vec<u32> {
     vec![]
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let matches = Command::new("radixfs")
         .version(crate_version!())
         .author("Rüdiger Klaehn")
@@ -2110,6 +2091,13 @@ fn main() {
                 .value_name("MOUNT_POINT")
                 .default_value("")
                 .help("Act as a client, and mount FUSE at given path")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::new("block-file")
+                .long("block-file")
+                .value_name("BLOCK_FILE")
+                .help("Mount the given radixdb block file")
                 .takes_value(true),
         )
         .arg(
@@ -2141,7 +2129,18 @@ fn main() {
         .unwrap_or_default()
         .to_string();
 
-    let result = fuser::mount2(RadixFS::new(), mountpoint, &options);
+    let file_name: String = matches
+        .value_of("block-file")
+        .unwrap_or("radixfs.db")
+        .to_string();
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(file_name)?;
+    let filesystem = RadixFS::open(file)?;
+    let result = fuser::mount2(filesystem, mountpoint, &options);
     if let Err(e) = result {
         // Return a special error code for permission denied, which usually indicates that
         // "user_allow_other" is missing from /etc/fuse.conf
@@ -2150,4 +2149,5 @@ fn main() {
             std::process::exit(2);
         }
     }
+    Ok(())
 }
