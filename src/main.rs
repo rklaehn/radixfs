@@ -18,12 +18,10 @@ use std::env;
 use std::ffi::OsStr;
 use std::fmt::Display;
 use std::fs::{File, OpenOptions};
-use std::io::{Cursor, ErrorKind};
+use std::io::{Cursor, ErrorKind, BufReader, BufRead};
 use std::ops::Range;
 use std::os::raw::c_int;
 use std::os::unix::ffi::OsStrExt;
-#[cfg(target_os = "linux")]
-use std::os::unix::io::IntoRawFd;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1240,7 +1238,7 @@ impl Filesystem for RadixFS {
         name: &OsStr,
         new_parent: u64,
         new_name: &OsStr,
-        _flags: u32,
+        flags: u32,
         reply: ReplyEmpty,
     ) {
         let mut inner = self.inner.lock();
@@ -1299,48 +1297,41 @@ impl Filesystem for RadixFS {
         let now = time_now();
         #[cfg(target_os = "linux")]
         if flags & libc::RENAME_EXCHANGE as u32 != 0 {
-            let mut new_inode_attrs = match self.lookup_name(new_parent, new_name) {
-                Ok(attrs) => attrs,
-                Err(error_code) => {
-                    reply.error(error_code);
-                    return;
-                }
-            };
-
-            let mut entries = self.get_directory_content(new_parent).unwrap();
+            let mut new_inode_attrs = check_error!(reply, inner.lookup_name(new_parent, new_name));
+            let mut entries = check_error!(reply, inner.get_directory_content(new_parent));
             entries.insert(
                 new_name.as_bytes().to_vec(),
                 (inode_attrs.inode, inode_attrs.kind),
             );
-            self.write_directory_content(new_parent, entries);
+            check_error!(reply, inner.write_directory_content(new_parent, entries));
 
-            let mut entries = self.get_directory_content(parent).unwrap();
+            let mut entries = check_error!(reply, inner.get_directory_content(parent));
             entries.insert(
                 name.as_bytes().to_vec(),
                 (new_inode_attrs.inode, new_inode_attrs.kind),
             );
-            self.write_directory_content(parent, entries);
+            check_error!(reply, inner.write_directory_content(parent, entries));
 
             parent_attrs.last_metadata_changed = now;
             parent_attrs.last_modified = now;
-            self.write_inode(&parent_attrs);
+            check_error!(reply, inner.write_inode(&parent_attrs));
             new_parent_attrs.last_metadata_changed = now;
             new_parent_attrs.last_modified = now;
-            self.write_inode(&new_parent_attrs);
+            check_error!(reply, inner.write_inode(&new_parent_attrs));
             inode_attrs.last_metadata_changed = now;
-            self.write_inode(&inode_attrs);
+            check_error!(reply, inner.write_inode(&inode_attrs));
             new_inode_attrs.last_metadata_changed = now;
-            self.write_inode(&new_inode_attrs);
+            check_error!(reply, inner.write_inode(&new_inode_attrs));
 
             if inode_attrs.kind == FileKind::Directory {
-                let mut entries = self.get_directory_content(inode_attrs.inode).unwrap();
+                let mut entries = check_error!(reply, inner.get_directory_content(inode_attrs.inode));
                 entries.insert(b"..".to_vec(), (new_parent, FileKind::Directory));
-                self.write_directory_content(inode_attrs.inode, entries);
+                check_error!(reply, inner.write_directory_content(inode_attrs.inode, entries));
             }
             if new_inode_attrs.kind == FileKind::Directory {
-                let mut entries = self.get_directory_content(new_inode_attrs.inode).unwrap();
+                let mut entries = check_error!(reply, inner.get_directory_content(new_inode_attrs.inode));
                 entries.insert(b"..".to_vec(), (parent, FileKind::Directory));
-                self.write_directory_content(new_inode_attrs.inode, entries);
+                check_error!(reply, inner.write_directory_content(new_inode_attrs.inode, entries));
             }
 
             reply.ok();
@@ -1916,36 +1907,37 @@ impl Filesystem for RadixFS {
         );
     }
 
-    #[cfg(target_os = "linux")]
-    fn fallocate(
-        &mut self,
-        _req: &Request<'_>,
-        inode: u64,
-        _fh: u64,
-        offset: i64,
-        length: i64,
-        mode: i32,
-        reply: ReplyEmpty,
-    ) {
-        let path = self.content_path(inode);
-        if let Ok(file) = OpenOptions::new().write(true).open(&path) {
-            unsafe {
-                libc::fallocate64(file.into_raw_fd(), mode, offset, length);
-            }
-            if mode & libc::FALLOC_FL_KEEP_SIZE == 0 {
-                let mut attrs = self.get_inode(inode).unwrap();
-                attrs.last_metadata_changed = now;
-                attrs.last_modified = now;
-                if (offset + length) as u64 > attrs.size {
-                    attrs.size = (offset + length) as u64;
-                }
-                self.write_inode(&attrs);
-            }
-            reply.ok();
-        } else {
-            reply.error(libc::ENOENT);
-        }
-    }
+    // #[cfg(target_os = "linux")]
+    // fn fallocate(
+    //     &mut self,
+    //     _req: &Request<'_>,
+    //     inode: u64,
+    //     _fh: u64,
+    //     offset: i64,
+    //     length: i64,
+    //     mode: i32,
+    //     reply: ReplyEmpty,
+    // ) {
+    //     let mut inner = self.inner.lock();
+    //     let path = content_path(inode);
+    //     if let Ok(file) = OpenOptions::new().write(true).open(&path) {
+    //         unsafe {
+    //             libc::fallocate64(file.into_raw_fd(), mode, offset, length);
+    //         }
+    //         if mode & libc::FALLOC_FL_KEEP_SIZE == 0 {
+    //             let mut attrs = inner.get_inode(inode).unwrap();
+    //             attrs.last_metadata_changed = now;
+    //             attrs.last_modified = now;
+    //             if (offset + length) as u64 > attrs.size {
+    //                 attrs.size = (offset + length) as u64;
+    //             }
+    //             inner.write_inode(&attrs);
+    //         }
+    //         reply.ok();
+    //     } else {
+    //         reply.error(libc::ENOENT);
+    //     }
+    // }
 
     #[allow(unused_variables, unused_mut)]
     fn copy_file_range(
@@ -2061,7 +2053,7 @@ fn as_file_kind(mut mode: u32) -> FileKind {
     }
 }
 
-fn get_groups(_pid: u32) -> Vec<u32> {
+fn get_groups(pid: u32) -> Vec<u32> {
     #[cfg(not(target_os = "macos"))]
     {
         let path = format!("/proc/{}/task/{}/status", pid, pid);
