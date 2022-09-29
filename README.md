@@ -19,3 +19,6 @@ echo foo > bar
 ```
 
 Supports directories, files and symlinks, file attributes and xattrs.
+
+Tested on M1 Mac and amd64 linux.
+    
